@@ -4,19 +4,51 @@ import sys
 class Error(BaseException):
     pass
 
+class Instruction:
+    def __init__(self, size, opcode, operand):
+        self._size = size
+        self.opcode = opcode
+        self.operand = operand
+    def bytes(self):
+        return [self.opcode] + self.operand()
+    def size(self):
+        return self._size
+
+class Data:
+    def __init__(self, data):
+        self.data = data
+    def bytes(self):
+        return self.data
+    def size(self):
+        return len(self.data)
+
 class Emitter:
     def __init__(self):
         self.pc = 0
-    def emit(self, bytes):
-        print(" ".join("{:02x}".format(x) for x in bytes))
-        self.pc += len(bytes)
+        self.ranges = []
+    def dump(self):
+        for r in self.ranges:
+            pc = r[0]
+            for ins in r[1]:
+                print("{:x}- {}".format(pc, " ".join("{:02x}".format(x) for x in ins.bytes())))
+                pc += ins.size()
+    def emit(self, ins):
+        self.ranges[-1][1].append(ins)
+        self.pc += ins.size()
     def get_pc(self):
         return self.pc
     def set_org(self, pc):
         self.pc = pc
+        self.ranges.append((pc, []))
 
 emitter = Emitter()
 symbols = {}
+
+def find(f, seq):
+    """Return first item in sequence where f(item) == True."""
+    for item in seq:
+        if f(item): 
+            return item
 
 def strip(s):
     return s.translate({ord(" "): None})
@@ -24,163 +56,163 @@ def strip(s):
 def parse(value):
     if value.startswith("$"):
         return int(value[1:], 16)
-    else:
+    elif value[0].isdigit():
         return int(value)
+    else:
+        return None
+
+class TokenKind:
+    pass
+
+WORD = TokenKind()
+STRING = TokenKind()
+
+def tokenise(s):
+    i = 0
+    while i < len(s):
+        if s[i] == '"':
+            m = re.match(r'"((\\.|[^"])*)"', s[i:])
+            if m is not None:
+                yield (STRING, m.group(1))
+                i += m.end(0)
+            else:
+                raise Error("Unterminated string")
+        elif not s[i].isspace():
+            m = re.match(r"\S+", s[i:])
+            yield (WORD, m.group(0))
+            i += m.end(0)
+        else:
+            i += 1
+
+def evaluate(s):
+    offset = 0
+    m = re.search(r"\+\s*(\d+)", s)
+    if m is not None:
+        offset = int(m.group(1))
+        s = s[:m.start(0)]
+    val = parse(s)
+    if val is not None:
+        return val + offset
+    val = symbols.get(s)
+    if val is not None:
+        return val + offset
+    raise Error("Unknown symbol: {}".format(s))
+
+def operand_byte(x):
+    if 0 <= x <= 0xff:
+        return [x]
+    else:
+        raise Error("Immediate value out of range: {}".format(x))
+
+def operand_sbyte(x):
+    if -0x80 <= x <= 0x7f:
+        if x < 0:
+            x += 0x100
+        return [x]
+    else:
+        raise Error("Address value too far: {}".format(x))
+
+def operand_word(x):
+    if 0 <= x <= 0xffff:
+        return [x & 0xff, x >> 8]
+    else:
+        raise Error("Address value out of range: {}".format(x))
 
 def absolute_mode(operand):
-    m = re.match(r"([$\w]+)$", strip(operand))
-    if m is None:
-        return None
-    s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xffff:
-        return [a & 0xff, a >> 8]
-    else:
-        raise Error("Address value out of range: {}".format(a))
+    return 3, lambda: operand_word(evaluate(operand))
 
 def absolute_x_mode(operand):
-    m = re.match(r"([$\w]+),X$", strip(operand), re.IGNORECASE)
+    m = re.match(r"(.+),X$", strip(operand), re.IGNORECASE)
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xffff:
-        return [a & 0xff, a >> 8]
-    else:
-        raise Error("Address value out of range: {}".format(a))
+    return 3, lambda: operand_word(evaluate(s))
 
 def absolute_y_mode(operand):
-    m = re.match(r"([$\w]+),Y$", strip(operand), re.IGNORECASE)
+    m = re.match(r"(.+),Y$", strip(operand), re.IGNORECASE)
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xffff:
-        return [a & 0xff, a >> 8]
-    else:
-        raise Error("Address value out of range: {}".format(a))
+    return 3, lambda: operand_word(evaluate(s))
 
 def immediate_mode(operand):
-    m = re.match(r"#([<>])?([$\w]+)$", strip(operand))
+    m = re.match(r"#(([<>])?(.+))$", strip(operand))
     if m is None:
         return None
-    s = m.group(2)
-    v = symbols.get(s)
-    if v is None:
-        v = parse(s)
-    hilo = m.group(1)
+    s = m.group(3)
+    hilo = m.group(2)
     if hilo:
         if hilo == ">":
-            v = v & 0xff
+            return 2, lambda: operand_byte(evaluate(s) & 0xff)
         elif hilo == "<":
-            v = v >> 8
-    if 0 <= v <= 0xff:
-        return [v]
+            return 2, lambda: operand_byte(evaluate(s) >> 8)
     else:
-        raise Error("Immediate value out of range: {}".format(v))
+        return 2, lambda: operand_byte(evaluate(s))
 
 def indirect_mode(operand):
-    m = re.match(r"\(([$\w]+)\)$", strip(operand))
+    m = re.match(r"\((.+)\)$", strip(operand))
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xffff:
-        return [a & 0xff, a >> 8]
-    else:
-        raise Error("Address value out of range: {}".format(a))
+    return 3, lambda: operand_word(evaluate(s))
 
 def indirect_x_mode(operand):
-    m = re.match(r"\(([$\w]+),X\)$", strip(operand), re.IGNORECASE)
+    m = re.match(r"\((.+),X\)$", strip(operand), re.IGNORECASE)
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xff:
-        return [a]
-    else:
-        raise Error("Address out of range: {}".format(a))
+    return 2, lambda: operand_byte(evaluate(s))
 
 def indirect_y_mode(operand):
-    m = re.match(r"\(([$\w]+)\),Y$", strip(operand), re.IGNORECASE)
+    m = re.match(r"\((.+)\),Y$", strip(operand), re.IGNORECASE)
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xff:
-        return [a]
-    else:
-        raise Error("Address out of range: {}".format(a))
+    return 2, lambda: operand_byte(evaluate(s))
 
 def relative_mode(operand):
-    m = re.match(r"([$\w]+)$", strip(operand))
+    m = re.match(r"(.+)$", strip(operand))
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xffff:
-        r = a - (emitter.get_pc() + 2)
-        if -0x80 <= r <= 0x7f:
-            if r < 0:
-                r += 0x100
-            return [r]
-        else:
-            raise Error("Address value too far: {}".format(a))
-    else:
-        raise Error("Address value out of range: {}".format(a))
+    pc = emitter.get_pc()
+    return 2, lambda: operand_sbyte(evaluate(s) - (pc + 2))
 
 def zero_page_mode(operand):
-    m = re.match(r"([$\w]+)$", strip(operand))
+    m = re.match(r"(.+)$", strip(operand))
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xff:
-        return [a]
-    else:
-        return None
+    return 2, lambda: operand_byte(evaluate(s))
 
 def zero_page_x_mode(operand):
-    m = re.match(r"([$\w]+)$", strip(operand), re.IGNORECASE)
+    m = re.match(r"(.+),X$", strip(operand), re.IGNORECASE)
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xff:
-        return [a]
-    else:
-        return None
+    return 2, lambda: operand_byte(evaluate(s))
 
 def zero_page_y_mode(operand):
-    m = re.match(r"([$\w]+)$", strip(operand), re.IGNORECASE)
+    m = re.match(r"(.+),Y$", strip(operand), re.IGNORECASE)
     if m is None:
         return None
     s = m.group(1)
-    a = symbols.get(s)
-    if a is None:
-        a = parse(s)
-    if 0 <= a <= 0xff:
-        return [a]
-    else:
-        return None
+    return 2, lambda: operand_byte(evaluate(s))
+
+OpcodeParseOrder = (
+    indirect_x_mode,    # (zzz,X)
+    indirect_y_mode,    # (zzz),Y
+    zero_page_x_mode,   # zzz,X
+    zero_page_y_mode,   # zzz,Y
+    absolute_x_mode,    # zzz,X
+    absolute_y_mode,    # zzz,Y
+    immediate_mode,     # #zzz
+    indirect_mode,      # (zzz)
+    zero_page_mode,     # zzz
+    absolute_mode,      # zzz
+    relative_mode,      # zzz
+    None
+)
 
 Opcodes = {
     "ADC": [(0x61, indirect_x_mode),
@@ -336,56 +368,85 @@ Opcodes = {
     "TYA": [(0x98, None)],
 }
 
+def op_DB(operand):
+    return Data(list(map(ord, operand)))
+
 def op_DW(operand):
     emitter.set_org(emitter.get_pc() + parse(operand))
+    return None
 
 def op_ORG(operand):
     emitter.set_org(parse(operand))
+    return None
 
 def opcode(mnemonic, operand):
     modes = Opcodes.get(mnemonic.upper())
     if modes is None:
-        return False
-    for op, amode in modes:
-        if amode is None:
-            if operand:
-                return False
-            bytes = []
-            break
-        bytes = amode(operand)
-        if bytes is not None:
-            break
-    else:
-        return False
-    emitter.emit([op] + bytes)
-    return True
+        return None
+    size = 1
+    opfunc = None
+    for parser in OpcodeParseOrder:
+        for op, amode in modes:
+            if amode is not parser:
+                continue
+            if amode is None:
+                if operand:
+                    return None
+                return Instruction(size, op, lambda: [])
+            r = amode(operand)
+            if r is not None:
+                size, opfunc = r
+                return Instruction(size, op, opfunc)
+    return None
+
+def assemble(infile, outfile):
+    with open(infile) as inf:
+        for s in inf:
+            a = list(tokenise(s))
+            comment = find(lambda x: x[1][0] is WORD and x[1][1].startswith(";"), enumerate(a))
+            if comment:
+                a = a[:comment[0]]
+            it = iter(a)
+            tok = next(it, None)
+            if tok is None:
+                continue
+            if tok[0] is WORD and tok[1].endswith(":"):
+                label = tok[1][:-1]
+                if label in symbols:
+                    raise Error("Duplicate symbol: {}".format(label))
+                symbols[label] = emitter.get_pc()
+                tok = next(it, None)
+            if tok is None:
+                continue
+            if tok[0] is not WORD:
+                raise Error("Mnemonic expected: {}".format(tok))
+            mnemonic = tok[1]
+            operand = list(it)
+            print(operand)
+            it = iter(operand)
+            tok = next(it, None)
+            operand = ""
+            while tok:
+                operand += tok[1]
+                tok = next(it, None)
+            if tok is not None:
+                raise Error("Extra input on line: {}".format(s))
+            op = globals().get("op_" + mnemonic.upper())
+            if op is not None:
+                ins = op(operand)
+                if ins is not None:
+                    emitter.emit(ins)
+            else:
+                ins = opcode(mnemonic, operand)
+                if ins is None:
+                    print(s)
+                    raise Error("Unknown opcode: {}".format(mnemonic))
+                emitter.emit(ins)
+        emitter.dump()
 
 def main():
-    f = open(sys.argv[1])
-    for s in f:
-        i = s.find(";")
-        if i >= 0:
-            s = s[:i]
-        m = re.search(r"((\w+)\s*:)?\s*((\w+)(\s+(.+))?)?\s*$", s)
-        #               12             34    5   6
-        if m is None:
-            raise Error("Syntax error")
-        label = m.group(2)
-        mnemonic = m.group(4)
-        operand = m.group(6)
-        if label is not None:
-            if label in symbols:
-                raise Error("Duplicate symbol: {}".format(label))
-            symbols[label] = emitter.get_pc()
-        if mnemonic is None:
-            continue
-        f = globals().get("op_" + mnemonic.upper())
-        if f is not None:
-            f(operand)
-        else:
-            if not opcode(mnemonic, operand):
-                print(s)
-                raise Error("Unknown opcode: {}".format(mnemonic))
+    fn = sys.argv[1]
+    assemble(fn, fn[:-2] + ".o")
 
 if __name__ == "__main__":
     main()
