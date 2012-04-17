@@ -1,3 +1,5 @@
+import itertools
+import json
 import re
 import sys
 
@@ -16,7 +18,15 @@ class Instruction:
 
 class Data:
     def __init__(self, data):
-        self.data = data
+        self.data = list(map(parse, "".join(map(chr, data)).split(",")))
+    def bytes(self):
+        return self.data
+    def size(self):
+        return len(self.data)
+
+class DataW:
+    def __init__(self, data):
+        self.data = list(itertools.chain(*[[x & 0xff, x >> 8] for x in map(parse, "".join(map(chr, data)).split(","))]))
     def bytes(self):
         return self.data
     def size(self):
@@ -35,6 +45,8 @@ class Emitter:
     def emit(self, ins):
         self.ranges[-1][1].append(ins)
         self.pc += ins.size()
+    def getbytes(self):
+        return [(address, list(itertools.chain(*[x.bytes() for x in insns]))) for address, insns in self.ranges if insns]
     def get_pc(self):
         return self.pc
     def set_org(self, pc):
@@ -61,6 +73,15 @@ def parse(value):
     else:
         return None
 
+def apple_charset(s):
+    trans = {x: 0xc0 | (x & 0x3f) for x in range(32, 32 + 64)}
+    r = []
+    for c in s:
+        if not ord(c) in trans:
+            raise Error("String literal contains non-apple character")
+        r.append(trans[ord(c)])
+    return r
+
 class TokenKind:
     pass
 
@@ -73,7 +94,7 @@ def tokenise(s):
         if s[i] == '"':
             m = re.match(r'"((\\.|[^"])*)"', s[i:])
             if m is not None:
-                yield (STRING, m.group(1))
+                yield (STRING, apple_charset(m.group(1)))
                 i += m.end(0)
             else:
                 raise Error("Unterminated string")
@@ -86,9 +107,9 @@ def tokenise(s):
 
 def evaluate(s):
     offset = 0
-    m = re.search(r"\+\s*(\d+)", s)
+    m = re.search(r"[+-]\s*(\d+)$", s)
     if m is not None:
-        offset = int(m.group(1))
+        offset = int(m.group(0))
         s = s[:m.start(0)]
     val = parse(s)
     if val is not None:
@@ -183,14 +204,24 @@ def zero_page_mode(operand):
     if m is None:
         return None
     s = m.group(1)
-    return 2, lambda: operand_byte(evaluate(s))
+    try:
+        if 0 <= evaluate(s) <= 0xff:
+            return 2, lambda: operand_byte(evaluate(s))
+    except Error:
+        pass
+    return None
 
 def zero_page_x_mode(operand):
     m = re.match(r"(.+),X$", strip(operand), re.IGNORECASE)
     if m is None:
         return None
     s = m.group(1)
-    return 2, lambda: operand_byte(evaluate(s))
+    try:
+        if 0 <= evaluate(s) <= 0xff:
+            return 2, lambda: operand_byte(evaluate(s))
+    except Error:
+        pass
+    return None
 
 def zero_page_y_mode(operand):
     m = re.match(r"(.+),Y$", strip(operand), re.IGNORECASE)
@@ -372,11 +403,21 @@ def op_DB(operand):
     return Data(list(map(ord, operand)))
 
 def op_DW(operand):
+    return DataW(list(map(ord, operand)))
+
+def op_DAT(operand):
     emitter.set_org(emitter.get_pc() + parse(operand))
     return None
 
 def op_ORG(operand):
     emitter.set_org(parse(operand))
+    return None
+
+def op_SET(operand):
+    m = re.match(r"(\w+)=(.*)", operand)
+    if m is None:
+        raise Error("Incorrect syntax: " + operand)
+    symbols[m.group(1)] = parse(m.group(2))
     return None
 
 def opcode(mnemonic, operand):
@@ -393,56 +434,58 @@ def opcode(mnemonic, operand):
                 if operand:
                     return None
                 return Instruction(size, op, lambda: [])
-            r = amode(operand)
-            if r is not None:
-                size, opfunc = r
-                return Instruction(size, op, opfunc)
+            if operand:
+                r = amode(operand)
+                if r is not None:
+                    size, opfunc = r
+                    return Instruction(size, op, opfunc)
     return None
+
+def assemble_instruction(s):
+    a = list(tokenise(s))
+    comment = find(lambda x: x[1][0] is WORD and x[1][1].startswith(";"), enumerate(a))
+    if comment:
+        a = a[:comment[0]]
+    it = iter(a)
+    tok = next(it, None)
+    if tok is None:
+        return None
+    if tok[0] is WORD and tok[1].endswith(":"):
+        label = tok[1][:-1]
+        if label in symbols:
+            raise Error("Duplicate symbol: {}".format(label))
+        symbols[label] = emitter.get_pc()
+        tok = next(it, None)
+    if tok is None:
+        return None
+    if tok[0] is not WORD:
+        raise Error("Mnemonic expected: {}".format(tok))
+    mnemonic = tok[1]
+    tok = next(it, None)
+    operand = ""
+    while tok:
+        operand += tok[1]
+        tok = next(it, None)
+    if tok is not None:
+        raise Error("Extra input on line: {}".format(s))
+    op = globals().get("op_" + mnemonic.upper())
+    if op is not None:
+        return op(operand)
+    else:
+        ins = opcode(mnemonic, operand)
+        if ins is None:
+            print(s)
+            raise Error("Unknown opcode: {}".format(mnemonic))
+        return ins
 
 def assemble(infile, outfile):
     with open(infile) as inf:
         for s in inf:
-            a = list(tokenise(s))
-            comment = find(lambda x: x[1][0] is WORD and x[1][1].startswith(";"), enumerate(a))
-            if comment:
-                a = a[:comment[0]]
-            it = iter(a)
-            tok = next(it, None)
-            if tok is None:
-                continue
-            if tok[0] is WORD and tok[1].endswith(":"):
-                label = tok[1][:-1]
-                if label in symbols:
-                    raise Error("Duplicate symbol: {}".format(label))
-                symbols[label] = emitter.get_pc()
-                tok = next(it, None)
-            if tok is None:
-                continue
-            if tok[0] is not WORD:
-                raise Error("Mnemonic expected: {}".format(tok))
-            mnemonic = tok[1]
-            operand = list(it)
-            print(operand)
-            it = iter(operand)
-            tok = next(it, None)
-            operand = ""
-            while tok:
-                operand += tok[1]
-                tok = next(it, None)
-            if tok is not None:
-                raise Error("Extra input on line: {}".format(s))
-            op = globals().get("op_" + mnemonic.upper())
-            if op is not None:
-                ins = op(operand)
-                if ins is not None:
-                    emitter.emit(ins)
-            else:
-                ins = opcode(mnemonic, operand)
-                if ins is None:
-                    print(s)
-                    raise Error("Unknown opcode: {}".format(mnemonic))
+            ins = assemble_instruction(s)
+            if ins is not None:
                 emitter.emit(ins)
-        emitter.dump()
+        with open(outfile, "w") as outf:
+            print(json.dumps(emitter.getbytes()), file=outf)
 
 def main():
     fn = sys.argv[1]
